@@ -2,11 +2,13 @@ import os
 import io
 import json
 import struct
+import uuid
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import resample_poly
 from flask import Flask, request, render_template, jsonify, session
 import requests
+from requests.exceptions import RequestException
 
 app = Flask(__name__)
 app.secret_key = "loa-esp32-secret-key"
@@ -48,10 +50,12 @@ def to_float32(data: np.ndarray) -> np.ndarray:
 
 
 def optimize_wav_to_pcm(input_bytes: bytes,
-                         target_sr: int = 16000) -> bytes:
+                        target_sr: int | None = None,
+                        normalize: bool = False) -> tuple[bytes, int]:
     """
-    Chuyển WAV bất kỳ → raw PCM 16-bit mono 16kHz (không có header).
-    Đây là format nhỏ nhất, ESP32 I2S phát trực tiếp.
+    Chuyển WAV bất kỳ → raw PCM 16-bit mono (không có header).
+    - Mặc định giữ nguyên sample rate gốc để tránh lệch tốc độ.
+    - Chỉ resample khi target_sr được truyền vào.
     """
     buf = io.BytesIO(input_bytes)
     sr, data = wavfile.read(buf)
@@ -63,21 +67,23 @@ def optimize_wav_to_pcm(input_bytes: bytes,
         audio = audio.mean(axis=1)
 
     # Resample về target_sr nếu khác
-    if sr != target_sr:
+    if target_sr and sr != target_sr:
         from math import gcd
         g    = gcd(target_sr, sr)
         up   = target_sr // g
         down = sr // g
         audio = resample_poly(audio, up, down).astype(np.float32)
+        sr = target_sr
 
-    # Normalize tránh clipping
-    peak = np.max(np.abs(audio))
-    if peak > 0:
-        audio = audio / peak * 0.95
+    # Chỉ normalize khi cần, để giữ dynamics gốc
+    if normalize:
+        peak = np.max(np.abs(audio))
+        if peak > 0:
+            audio = audio / peak * 0.95
 
     # Chuyển về int16 → bytes
     pcm = (audio * 32767).astype(np.int16)
-    return pcm.tobytes()
+    return pcm.tobytes(), sr
 
 
 def build_wav_header(pcm_data: bytes,
@@ -107,10 +113,11 @@ def build_wav_header(pcm_data: bytes,
 
 
 def optimize_wav_with_header(input_bytes: bytes,
-                              target_sr: int = 16000) -> bytes:
+                             target_sr: int | None = None,
+                             normalize: bool = False) -> tuple[bytes, int]:
     """Optimize + thêm WAV header → dùng khi upload lên LittleFS"""
-    pcm = optimize_wav_to_pcm(input_bytes, target_sr)
-    return build_wav_header(pcm, target_sr) + pcm
+    pcm, sr = optimize_wav_to_pcm(input_bytes, target_sr, normalize)
+    return build_wav_header(pcm, sr) + pcm, sr
 
 
 def get_wav_info(input_bytes: bytes) -> dict:
@@ -163,9 +170,9 @@ def api_analyze():
     raw = f.read()
     try:
         info = get_wav_info(raw)
-        pcm  = optimize_wav_to_pcm(raw)
+        pcm, optimized_sr = optimize_wav_to_pcm(raw)
         info["optimized_size_kb"] = round(len(pcm) / 1024, 1)
-        info["optimized_sr"]      = 16000
+        info["optimized_sr"]      = optimized_sr
         info["reduction_pct"]     = round((1 - len(pcm) / len(raw)) * 100, 1)
         return jsonify(info)
     except Exception as e:
@@ -187,7 +194,7 @@ def api_upload():
 
     raw = f.read()
     try:
-        optimized = optimize_wav_with_header(raw)
+        optimized, out_sr = optimize_wav_with_header(raw)
     except Exception as e:
         return jsonify({"error": f"Optimize thất bại: {e}"}), 500
 
@@ -202,6 +209,7 @@ def api_upload():
             "filename"     : filename,
             "original_kb"  : round(len(raw) / 1024, 1),
             "uploaded_kb"  : round(len(optimized) / 1024, 1),
+            "sample_rate"  : out_sr,
             "esp32_response": resp.json()
         })
     except Exception as e:
@@ -228,7 +236,7 @@ def api_play():
 
 @app.route("/api/play-stream", methods=["POST"])
 def api_play_stream():
-    """Optimize WAV → raw PCM → stream thẳng tới ESP32 để phát ngay"""
+    """Phát ngay: ưu tiên stream trực tiếp; fallback upload tạm + play."""
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "Không có file"}), 400
@@ -237,24 +245,68 @@ def api_play_stream():
     raw = f.read()
 
     try:
-        pcm = optimize_wav_to_pcm(raw)   # raw PCM không header
+        wav_payload, out_sr = optimize_wav_with_header(raw)
     except Exception as e:
         return jsonify({"error": f"Optimize thất bại: {e}"}), 500
 
+    stream_filename = f"stream_{uuid.uuid4().hex[:8]}.wav"
+
     try:
+        # Cách 1: stream trực tiếp tới endpoint play-stream
         resp = requests.post(
             f"http://{cfg['esp32_ip']}/play-stream",
-            data=pcm,
-            headers={"Content-Type": "application/octet-stream"},
+            files={"file": (stream_filename, wav_payload, "audio/wav")},
             timeout=60
         )
+        resp.raise_for_status()
+
+        payload = resp.json() if resp.content else {"status": "ok"}
         return jsonify({
             "status"       : "ok",
-            "streamed_kb"  : round(len(pcm) / 1024, 1),
-            "esp32_response": resp.json()
+            "mode"         : "direct-stream",
+            "sample_rate"  : out_sr,
+            "streamed_kb"  : round(len(wav_payload) / 1024, 1),
+            "esp32_response": payload
         })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        # Cách 2 (an toàn): upload file tạm, gọi play ngay, rồi dọn dẹp
+        try:
+            upload_resp = requests.post(
+                f"http://{cfg['esp32_ip']}/audio/upload",
+                files={"file": (stream_filename, wav_payload, "audio/wav")},
+                timeout=60
+            )
+            upload_resp.raise_for_status()
+
+            play_resp = requests.get(
+                f"http://{cfg['esp32_ip']}/play",
+                params={"file": stream_filename},
+                timeout=8
+            )
+            play_resp.raise_for_status()
+
+            # Dọn file tạm (best effort)
+            try:
+                requests.delete(
+                    f"http://{cfg['esp32_ip']}/audio/delete",
+                    params={"file": stream_filename},
+                    timeout=5
+                )
+            except RequestException:
+                pass
+
+            return jsonify({
+                "status"       : "ok",
+                "mode"         : "fallback-upload-play",
+                "sample_rate"  : out_sr,
+                "streamed_kb"  : round(len(wav_payload) / 1024, 1),
+                "esp32_response": {
+                    "upload": upload_resp.json() if upload_resp.content else {"status": "ok"},
+                    "play": play_resp.json() if play_resp.content else {"status": "ok"}
+                }
+            })
+        except Exception as e:
+            return jsonify({"error": f"Stream thất bại (direct + fallback): {e}"}), 500
 
 
 @app.route("/api/list", methods=["GET"])
