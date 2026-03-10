@@ -1,0 +1,5 @@
+flask==3.0.3
+requests==2.32.3
+numpy==2.0.0
+scipy==1.13.1
+pydub==0.25.1
