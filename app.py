@@ -18,6 +18,13 @@ CONFIG_FILE   = "config.json"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ============================================================
+# ESP32 AUDIO CONFIG - Config #3 từ test
+# ============================================================
+TARGET_SAMPLE_RATE = 22050  # 22.05kHz - config #3 phát tốt nhất
+TARGET_CHANNELS    = 1      # Mono
+TARGET_BITS        = 16     # 16-bit
+
+# ============================================================
 # CONFIG - lưu IP vào file json
 # ============================================================
 def load_config() -> dict:
@@ -31,7 +38,7 @@ def save_config(data: dict):
         json.dump(data, f, indent=2)
 
 # ============================================================
-# XỬ LÝ WAV - optimize → raw PCM 16kHz mono 16-bit
+# XỬ LÝ WAV - optimize → 22.05kHz mono 16-bit
 # ============================================================
 def to_float32(data: np.ndarray) -> np.ndarray:
     """Chuyển bất kỳ dtype → float32 trong khoảng [-1.0, 1.0]"""
@@ -50,12 +57,12 @@ def to_float32(data: np.ndarray) -> np.ndarray:
 
 
 def optimize_wav_to_pcm(input_bytes: bytes,
-                        target_sr: int | None = None,
-                        normalize: bool = False) -> tuple[bytes, int]:
+                        target_sr: int = TARGET_SAMPLE_RATE,
+                        normalize: bool = True) -> tuple[bytes, int]:
     """
-    Chuyển WAV bất kỳ → raw PCM 16-bit mono (không có header).
-    - Mặc định giữ nguyên sample rate gốc để tránh lệch tốc độ.
-    - Chỉ resample khi target_sr được truyền vào.
+    Chuyển WAV bất kỳ → raw PCM 16-bit mono 22.05kHz (không có header).
+    - Luôn resample về 22.05kHz để khớp với ESP32 config #3
+    - Normalize để tránh méo tiếng
     """
     buf = io.BytesIO(input_bytes)
     sr, data = wavfile.read(buf)
@@ -66,8 +73,8 @@ def optimize_wav_to_pcm(input_bytes: bytes,
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
 
-    # Resample về target_sr nếu khác
-    if target_sr and sr != target_sr:
+    # Resample về 22.05kHz nếu khác
+    if sr != target_sr:
         from math import gcd
         g    = gcd(target_sr, sr)
         up   = target_sr // g
@@ -75,7 +82,7 @@ def optimize_wav_to_pcm(input_bytes: bytes,
         audio = resample_poly(audio, up, down).astype(np.float32)
         sr = target_sr
 
-    # Chỉ normalize khi cần, để giữ dynamics gốc
+    # Normalize để tránh clipping
     if normalize:
         peak = np.max(np.abs(audio))
         if peak > 0:
@@ -87,10 +94,10 @@ def optimize_wav_to_pcm(input_bytes: bytes,
 
 
 def build_wav_header(pcm_data: bytes,
-                     sample_rate: int,
-                     channels: int = 1,
-                     bits: int = 16) -> bytes:
-    """Tạo WAV header 44 bytes chuẩn"""
+                     sample_rate: int = TARGET_SAMPLE_RATE,
+                     channels: int = TARGET_CHANNELS,
+                     bits: int = TARGET_BITS) -> bytes:
+    """Tạo WAV header 44 bytes chuẩn cho ESP32"""
     data_size   = len(pcm_data)
     byte_rate   = sample_rate * channels * bits // 8
     block_align = channels * bits // 8
@@ -113,8 +120,8 @@ def build_wav_header(pcm_data: bytes,
 
 
 def optimize_wav_with_header(input_bytes: bytes,
-                             target_sr: int | None = None,
-                             normalize: bool = False) -> tuple[bytes, int]:
+                             target_sr: int = TARGET_SAMPLE_RATE,
+                             normalize: bool = True) -> tuple[bytes, int]:
     """Optimize + thêm WAV header → dùng khi upload lên LittleFS"""
     pcm, sr = optimize_wav_to_pcm(input_bytes, target_sr, normalize)
     return build_wav_header(pcm, sr) + pcm, sr
@@ -147,7 +154,13 @@ def index():
 # ============================================================
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
-    return jsonify(load_config())
+    cfg = load_config()
+    cfg["target_config"] = {
+        "sample_rate": TARGET_SAMPLE_RATE,
+        "channels": TARGET_CHANNELS,
+        "bits": TARGET_BITS
+    }
+    return jsonify(cfg)
 
 
 @app.route("/api/set-ip", methods=["POST"])
@@ -173,6 +186,8 @@ def api_analyze():
         pcm, optimized_sr = optimize_wav_to_pcm(raw)
         info["optimized_size_kb"] = round(len(pcm) / 1024, 1)
         info["optimized_sr"]      = optimized_sr
+        info["optimized_channels"] = TARGET_CHANNELS
+        info["optimized_bits"]     = TARGET_BITS
         info["reduction_pct"]     = round((1 - len(pcm) / len(raw)) * 100, 1)
         return jsonify(info)
     except Exception as e:
@@ -181,7 +196,7 @@ def api_analyze():
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Optimize WAV rồi upload lên LittleFS của ESP32"""
+    """Optimize WAV về 22.05kHz mono 16-bit rồi upload lên LittleFS của ESP32"""
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "Không có file"}), 400
@@ -210,6 +225,8 @@ def api_upload():
             "original_kb"  : round(len(raw) / 1024, 1),
             "uploaded_kb"  : round(len(optimized) / 1024, 1),
             "sample_rate"  : out_sr,
+            "channels"     : TARGET_CHANNELS,
+            "bits"         : TARGET_BITS,
             "esp32_response": resp.json()
         })
     except Exception as e:
@@ -236,7 +253,7 @@ def api_play():
 
 @app.route("/api/play-stream", methods=["POST"])
 def api_play_stream():
-    """Phát ngay: ưu tiên stream trực tiếp; fallback upload tạm + play."""
+    """Phát ngay: optimize về 22.05kHz mono 16-bit, ưu tiên stream trực tiếp"""
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "Không có file"}), 400
@@ -265,6 +282,8 @@ def api_play_stream():
             "status"       : "ok",
             "mode"         : "direct-stream",
             "sample_rate"  : out_sr,
+            "channels"     : TARGET_CHANNELS,
+            "bits"         : TARGET_BITS,
             "streamed_kb"  : round(len(wav_payload) / 1024, 1),
             "esp32_response": payload
         })
@@ -299,6 +318,8 @@ def api_play_stream():
                 "status"       : "ok",
                 "mode"         : "fallback-upload-play",
                 "sample_rate"  : out_sr,
+                "channels"     : TARGET_CHANNELS,
+                "bits"         : TARGET_BITS,
                 "streamed_kb"  : round(len(wav_payload) / 1024, 1),
                 "esp32_response": {
                     "upload": upload_resp.json() if upload_resp.content else {"status": "ok"},
@@ -345,4 +366,13 @@ def api_delete():
 # MAIN
 # ============================================================
 if __name__ == "__main__":
+    print("=" * 60)
+    print("🎵 ESP32 Audio Server - Optimized for Config #3")
+    print("=" * 60)
+    print(f"   Target Sample Rate: {TARGET_SAMPLE_RATE} Hz")
+    print(f"   Target Channels:    {TARGET_CHANNELS} (Mono)")
+    print(f"   Target Bits:        {TARGET_BITS} bit")
+    print("=" * 60)
+    print("   Server running on http://0.0.0.0:5000")
+    print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=True)
