@@ -25,10 +25,15 @@ h2 { color: #4ecca3; margin-bottom: 12px; font-size: 15px; }
 .card { background: #16213e; border-radius: 12px; padding: 20px; }
 .card.full { grid-column: 1 / -1; }
 label { font-size: 12px; color: #aaa; display: block; margin-bottom: 4px; margin-top: 8px; }
-input[type=text], input[type=file] {
+input[type=text], input[type=file], textarea {
   width: 100%; padding: 8px 10px; border-radius: 6px;
   border: 1px solid #333; background: #0f3460; color: #eee;
   font-size: 14px; margin-bottom: 6px;
+  font-family: Arial, sans-serif;
+}
+textarea {
+  resize: vertical;
+  min-height: 80px;
 }
 .ip-row { display: flex; gap: 8px; align-items: center; }
 .ip-row input { margin: 0; flex: 1; }
@@ -43,9 +48,11 @@ input[type=text], input[type=file] {
   transition: opacity .15s;
 }
 .btn:active { opacity: 0.75; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-red   { background: #e94560; color: #fff; }
 .btn-green { background: #4ecca3; color: #1a1a2e; }
 .btn-blue  { background: #0f3460; color: #eee; border: 1px solid #4ecca3; }
+.btn-yellow { background: #f39c12; color: #1a1a2e; }
 .btn-sm    { padding: 4px 12px; font-size: 12px; }
 .btn + .btn { margin-left: 6px; }
 .info-box {
@@ -76,6 +83,23 @@ td { padding: 7px 8px; border-bottom: 1px solid #222; vertical-align: middle; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* TTS Section */
+.tts-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.char-counter {
+  font-size: 11px;
+  color: #aaa;
+  text-align: right;
+  margin-top: -4px;
+  margin-bottom: 8px;
+}
+.char-counter.warning { color: #f39c12; }
+.char-counter.error { color: #e94560; }
+
 /* Footer */
 footer {
   text-align: center;
@@ -91,6 +115,8 @@ footer a:hover { text-decoration: underline; }
 @media (max-width: 600px) {
   .grid { grid-template-columns: 1fr; }
   .card.full { grid-column: 1; }
+  .tts-actions { flex-direction: column; }
+  .tts-actions .btn { width: 100%; }
 }
 </style>
 </head>
@@ -112,6 +138,33 @@ footer a:hover { text-decoration: underline; }
       <button class="btn btn-blue" onclick="saveIp()">💾 Lưu IP</button>
     </div>
     <div id="ipStatus" class="info-box" style="margin-top:8px;min-height:28px"></div>
+  </div>
+
+  <!-- ── TEXT-TO-SPEECH ── -->
+  <div class="card full">
+    <h2>🎤 Text-to-Speech (Piper TTS)</h2>
+    
+    <label>Nhập văn bản cần chuyển thành giọng nói</label>
+    <textarea id="ttsText" placeholder="Nhập văn bản tiếng Việt..." 
+              oninput="updateCharCounter()" maxlength="1000"></textarea>
+    <div id="charCounter" class="char-counter">0 / 1000 ký tự</div>
+    
+    <label>Tên file WAV (tùy chọn, để trống sẽ dùng timestamp)</label>
+    <input type="text" id="ttsFilename" placeholder="vd: thongbao.wav">
+    
+    <div class="tts-actions">
+      <button class="btn btn-yellow" onclick="generateTTS()" id="btnGenerate">
+        🎵 Tạo file WAV
+      </button>
+      <button class="btn btn-green" onclick="ttsUpload()" id="btnTtsUpload">
+        ⬆️ Tạo & Upload lên ESP32
+      </button>
+      <button class="btn btn-red" onclick="ttsStream()" id="btnTtsStream">
+        ▶️ Tạo & Phát ngay
+      </button>
+    </div>
+    
+    <div id="ttsStatus" class="info-box"></div>
   </div>
 
   <!-- ── Upload file ── -->
@@ -137,7 +190,7 @@ footer a:hover { text-decoration: underline; }
     <label>Chọn file WAV để stream</label>
     <input type="file" id="streamFile" accept=".wav">
     <p style="font-size:12px;color:#aaa;margin:8px 0 12px">
-      File sẽ được optimize → raw PCM 16kHz mono → stream thẳng tới ESP32,
+      File sẽ được optimize → raw PCM 22.05kHz mono → stream thẳng tới ESP32,
       phát ngay mà không cần lưu vào bộ nhớ.
     </p>
     <button class="btn btn-red" onclick="streamPlay()">▶ Phát ngay</button>
@@ -189,6 +242,29 @@ function infoRow(key, val, color) {
   </div>`;
 }
 
+// ── Character Counter ────────────────────────────────────────
+function updateCharCounter() {
+  const text = document.getElementById('ttsText').value;
+  const counter = document.getElementById('charCounter');
+  const len = text.length;
+  counter.textContent = `${len} / 1000 ký tự`;
+  
+  if (len > 900) {
+    counter.className = 'char-counter error';
+  } else if (len > 700) {
+    counter.className = 'char-counter warning';
+  } else {
+    counter.className = 'char-counter';
+  }
+}
+
+// ── Disable/Enable TTS Buttons ──────────────────────────────
+function setTTSButtonsState(disabled) {
+  document.getElementById('btnGenerate').disabled = disabled;
+  document.getElementById('btnTtsUpload').disabled = disabled;
+  document.getElementById('btnTtsStream').disabled = disabled;
+}
+
 // ── Lưu IP ───────────────────────────────────────────────────
 function saveIp() {
   const ip = document.getElementById('espIp').value.trim();
@@ -208,6 +284,129 @@ function saveIp() {
     document.getElementById('ipBadge').textContent = ip;
     document.getElementById('ipStatus').innerHTML =
       infoRow('Trạng thái', '✅ Đã lưu IP: ' + ip);
+  });
+}
+
+// ── TEXT-TO-SPEECH ───────────────────────────────────────────
+
+// 1. Chỉ tạo file WAV
+function generateTTS() {
+  const text = document.getElementById('ttsText').value.trim();
+  const filename = document.getElementById('ttsFilename').value.trim();
+  
+  if (!text) {
+    alert('⚠️ Vui lòng nhập văn bản!');
+    return;
+  }
+  
+  const status = document.getElementById('ttsStatus');
+  status.innerHTML = spin() + 'Đang tạo file WAV bằng Piper TTS...';
+  setTTSButtonsState(true);
+  
+  fetch('/api/tts/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, filename })
+  })
+  .then(r => r.json())
+  .then(d => {
+    setTTSButtonsState(false);
+    if (d.error) {
+      status.innerHTML = `<span class="err">❌ ${d.error}</span>`;
+      return;
+    }
+    status.innerHTML =
+      infoRow('Trạng thái', '✅ Tạo file thành công') +
+      infoRow('File', d.filename) +
+      infoRow('Đường dẫn', d.filepath) +
+      infoRow('Kích thước', d.size_kb + ' KB');
+  })
+  .catch(e => {
+    setTTSButtonsState(false);
+    status.innerHTML = `<span class="err">❌ ${e}</span>`;
+  });
+}
+
+// 2. TTS → Upload lên ESP32
+function ttsUpload() {
+  const text = document.getElementById('ttsText').value.trim();
+  const filename = document.getElementById('ttsFilename').value.trim();
+  
+  if (!text) {
+    alert('⚠️ Vui lòng nhập văn bản!');
+    return;
+  }
+  
+  const status = document.getElementById('ttsStatus');
+  status.innerHTML = spin() + 'Đang tạo file WAV & upload lên ESP32...';
+  setTTSButtonsState(true);
+  
+  fetch('/api/tts/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, filename })
+  })
+  .then(r => r.json())
+  .then(d => {
+    setTTSButtonsState(false);
+    if (d.error) {
+      status.innerHTML = `<span class="err">❌ ${d.error}</span>`;
+      return;
+    }
+    status.innerHTML =
+      infoRow('Trạng thái', '✅ Upload thành công') +
+      infoRow('Văn bản', '"' + d.text.substring(0, 50) + (d.text.length > 50 ? '..."' : '"')) +
+      infoRow('File', d.filename) +
+      infoRow('TTS size', d.tts_size_kb + ' KB') +
+      infoRow('Uploaded', d.uploaded_kb + ' KB (optimized)') +
+      infoRow('Config', `${d.sample_rate}Hz, ${d.channels}ch, ${d.bits}bit`);
+    
+    // Refresh danh sách file
+    loadList();
+  })
+  .catch(e => {
+    setTTSButtonsState(false);
+    status.innerHTML = `<span class="err">❌ ${e}</span>`;
+  });
+}
+
+// 3. TTS → Stream phát ngay
+function ttsStream() {
+  const text = document.getElementById('ttsText').value.trim();
+  const filename = document.getElementById('ttsFilename').value.trim();
+  
+  if (!text) {
+    alert('⚠️ Vui lòng nhập văn bản!');
+    return;
+  }
+  
+  const status = document.getElementById('ttsStatus');
+  status.innerHTML = spin() + 'Đang tạo file WAV & stream tới ESP32...';
+  setTTSButtonsState(true);
+  
+  fetch('/api/tts/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, filename })
+  })
+  .then(r => r.json())
+  .then(d => {
+    setTTSButtonsState(false);
+    if (d.error) {
+      status.innerHTML = `<span class="err">❌ ${d.error}</span>`;
+      return;
+    }
+    status.innerHTML =
+      infoRow('Trạng thái', '✅ Đang phát trên ESP32') +
+      infoRow('Văn bản', '"' + d.text.substring(0, 50) + (d.text.length > 50 ? '..."' : '"')) +
+      infoRow('Mode', d.mode === 'direct-stream' ? 'Stream trực tiếp' : 'Upload tạm + Play') +
+      infoRow('TTS size', d.tts_size_kb + ' KB') +
+      infoRow('Streamed', d.streamed_kb + ' KB (optimized)') +
+      infoRow('Config', `${d.sample_rate}Hz, ${d.channels}ch, ${d.bits}bit`);
+  })
+  .catch(e => {
+    setTTSButtonsState(false);
+    status.innerHTML = `<span class="err">❌ ${e}</span>`;
   });
 }
 
@@ -236,7 +435,7 @@ function analyzeFile() {
         infoRow('Kênh',                     d.channels === 1 ? 'Mono' : 'Stereo') +
         infoRow('Thời lượng',               d.duration_sec + ' giây') +
         infoRow('Kích thước gốc',           d.size_kb + ' KB') +
-        infoRow('Sau optimize (16kHz mono)',d.optimized_size_kb + ' KB') +
+        infoRow('Sau optimize (22.05kHz mono)',d.optimized_size_kb + ' KB') +
         infoRow('Giảm được',               d.reduction_pct + '%', '#e94560');
     })
     .catch(e => { box.innerHTML = `<span class="err">❌ ${e}</span>`; });
