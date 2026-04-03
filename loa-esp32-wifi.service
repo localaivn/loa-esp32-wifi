@@ -1,0 +1,16 @@
+[Unit]
+Description=LOA ESP32 Audio Server
+After=network.target
+
+[Service]
+Type=simple
+User=cat
+WorkingDirectory=/home/cat/loa-esp32-wifi
+ExecStart=/usr/bin/python3 /home/cat/loa-esp32-wifi/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
